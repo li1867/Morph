@@ -1,0 +1,351 @@
+#! /usr/bin/env python3.4
+import os
+import time
+import numpy as np
+import scipy
+from scipy import interpolate
+#from matplotlib.delaunay import interpolate
+from scipy.interpolate import RectBivariateSpline
+from scipy.spatial import Delaunay
+from scipy import ndimage
+import imageio
+from PIL import Image, ImageDraw
+
+class Affine:
+    def __init__(self, source, destination):
+       if source.dtype is not np.dtype('float64'):
+           raise ValueError('invalid type for source')
+       if destination.dtype is not np.dtype('float64'):
+           raise ValueError('invalid type for destination')
+       if source.shape != (3,2):
+           raise ValueError('invalid shape for source')
+       if destination.shape != (3,2):
+           raise ValueError('invalid shape for destination')
+
+       self.source = source
+       self.destination = destination
+
+       A = np.ndarray(shape=(6,6))
+       A[0] = [source[0][0], source[0][1], 1, 0, 0, 0]
+       A[1] = [0, 0, 0, source[0][0], source[0][1], 1]
+       A[2] = [source[1][0], source[1][1], 1, 0, 0, 0]
+       A[3] = [0, 0, 0, source[1][0], source[1][1], 1]
+       A[4] = [source[2][0], source[2][1], 1, 0, 0, 0]
+       A[5] = [0, 0, 0, source[2][0], source[2][1], 1]
+       B = np.ndarray(shape=(6,1))
+       B[0] = destination[0][0]
+       B[1] = destination[0][1]
+       B[2] = destination[1][0]
+       B[3] = destination[1][1]
+       B[4] = destination[2][0]
+       B[5] = destination[2][1]
+       h = np.linalg.solve(A, B)
+       self.matrix = np.ndarray(shape=(3,3))
+       self.matrix[0][0] = h[0]
+       self.matrix[0][1] = h[1]
+       self.matrix[0][2] = h[2]
+       self.matrix[1][0] = h[3]
+       self.matrix[1][1] = h[4]
+       self.matrix[1][2] = h[5]
+       self.matrix[2][0] = 0
+       self.matrix[2][1] = 0
+       self.matrix[2][2] = 1
+       #self.bi = None
+
+    def transform(self, sourceImage, destinationImage):  #
+        if sourceImage.dtype is not np.dtype('uint8'):
+            raise TypeError('invalid type for sourceImage')
+        if destinationImage.dtype is not np.dtype('uint8'):
+            raise TypeError('invalid type for destinationImage')
+
+        source = self.source
+        xmax = int(max(source[0][0], source[1][0], source[2][0]))
+        xmin = int(min(source[0][0], source[1][0], source[2][0]))
+        ymax = int(max(source[0][1], source[1][1], source[2][1]))
+        ymin = int(min(source[0][1], source[1][1], source[2][1]))
+        xmax += 1
+        xmin -= 1
+        ymax += 1
+        ymin -= 1
+        if xmax > sourceImage.shape[1]:
+            xmax = sourceImage.shape[1]
+        if xmin < 0:
+            xmin = 0
+        if ymax > sourceImage.shape[0]:
+            ymax = sourceImage.shape[0]
+        if ymin < 0:
+            ymin = 0
+
+        img = Image.new("L", ((sourceImage.shape[1]), (sourceImage.shape[0])), 0)
+        dest = []
+        for ele in self.destination:
+            dest.append(tuple(ele))
+        newsqu = sourceImage[ymin: ymax, xmin: xmax]
+        bi = interpolate.RectBivariateSpline(range(ymax - ymin), range(xmax - xmin), z = newsqu, kx = 1, ky = 1)
+        ImageDraw.Draw(img).polygon(dest, outline=255, fill= 255)
+        mask = np.array(img)
+        invers = np.linalg.inv(self.matrix)
+        x, y = np.where(mask == 255)
+        prime_matrix = np.ones(shape=(3, len(x)), dtype=np.float64)
+        prime_matrix[1], prime_matrix[0] = x, y
+        target=np.matmul(invers, prime_matrix)
+        temp = np.round(bi.ev(target[1] - ymin, target[0] - xmin))
+        destinationImage[x, y] = temp[list(range(len(x)))]
+
+class Blender:
+    def __init__(self, startImage, startPoints, endImage, endPoints):
+        if not isinstance(startImage, np.ndarray):
+            raise TypeError('startImage is invalid')
+        if not isinstance(startPoints, np.ndarray):
+            raise TypeError('startPoints is invalid')
+        if not isinstance(endImage, np.ndarray):
+            raise TypeError('endImage is invalid')
+        if not isinstance(endPoints, np.ndarray):
+            raise TypeError('endPoints is invalid')
+
+        self.startImage = startImage
+        self.startPoints = startPoints
+        self.endImage = endImage
+        self.endPoints = endPoints
+
+    def getBlendedImage(self, alpha):
+
+        newImage1 = Image.new('L', ((self.startImage.shape[1]), (self.startImage.shape[0])), 0)
+        newImage1 = np.array(newImage1)             #source image
+        newImage2 = Image.new('L', ((self.startImage.shape[1]), (self.startImage.shape[0])), 0)
+        newImage2 = np.array(newImage2)             #target image
+
+        source_tri = Delaunay(self.startPoints)
+        start_triangle = self.startPoints[source_tri.simplices].astype(np.float64)
+        end_triangle = self.endPoints[source_tri.simplices] .astype(np.float64)
+        size = len(source_tri.simplices)
+        mid_tri = start_triangle * (1 - alpha) + end_triangle * alpha
+
+        for i in range(size):
+           affine1 = Affine(start_triangle[i], mid_tri[i])
+           affine1.transform(self.startImage, newImage1)
+
+           affine2 = Affine(end_triangle[i], mid_tri[i])
+           affine2.transform(self.endImage, newImage2)
+
+        final_image = np.round((newImage1 * (1 - alpha) + newImage2 * alpha).astype(np.uint8))
+
+        return final_image
+
+    def generateMorphVideo(self, targetFolderPath, sequenceLength, includeResersed):
+        if os.path.exists(targetFolderPath) is False:
+            os.makedirs(targetFolderPath)
+        if sequenceLength < 10:
+            raise ValueError('wrong sequenceLength')
+        alpha = 0
+        increment = 1 / (sequenceLength-1)
+        i = 0
+        while (i < sequenceLength):
+            a = self.getBlendedImage(alpha)
+            digit = str(i+1).zfill(3)
+            imageio.imwrite(targetFolderPath + "/frame{" + digit + "}.jpg", a)
+            alpha += increment
+            if alpha > 1:
+                alpha = 1
+            i += 1
+
+        if includeResersed is True:
+            j = i
+            while i < 2 * sequenceLength:
+                digit = str(i+1).zfill(3)
+                a = self.getBlendedImage(alpha)
+                imageio.imwrite(targetFolderPath + "/frame{" + digit + "}.jpg", a)
+                alpha -= increment
+                if alpha < 0:
+                    alpha = 0
+                i += 1
+
+        video = imageio.get_writer(targetFolderPath + '/' + 'morph.mp4', fps = 5, macro_block_size = None)
+        for myFile in os.listdir(targetFolderPath):
+            frame = targetFolderPath+'/'+myFile
+            video.append_data(imageio.imread(frame))
+
+class ColorAffine:
+    def __init__(self, source, destination):
+       if source.dtype is not np.dtype('float64'):
+           raise ValueError('invalid type for source')
+       if destination.dtype is not np.dtype('float64'):
+           raise ValueError('invalid type for destination')
+       if source.shape != (3,2):
+           raise ValueError('invalid shape for source')
+       if destination.shape != (3,2):
+           raise ValueError('invalid shape for destination')
+
+       self.source = source
+       self.destination = destination
+
+       A = np.ndarray(shape=(6,6))
+       A[0] = [source[0][0], source[0][1], 1, 0, 0, 0]
+       A[1] = [0, 0, 0, source[0][0], source[0][1], 1]
+       A[2] = [source[1][0], source[1][1], 1, 0, 0, 0]
+       A[3] = [0, 0, 0, source[1][0], source[1][1], 1]
+       A[4] = [source[2][0], source[2][1], 1, 0, 0, 0]
+       A[5] = [0, 0, 0, source[2][0], source[2][1], 1]
+       B = np.ndarray(shape=(6,1))
+       B[0] = destination[0][0]
+       B[1] = destination[0][1]
+       B[2] = destination[1][0]
+       B[3] = destination[1][1]
+       B[4] = destination[2][0]
+       B[5] = destination[2][1]
+       h = np.linalg.solve(A, B)
+       self.matrix = np.ndarray(shape=(3,3))
+       self.matrix[0][0] = h[0]
+       self.matrix[0][1] = h[1]
+       self.matrix[0][2] = h[2]
+       self.matrix[1][0] = h[3]
+       self.matrix[1][1] = h[4]
+       self.matrix[1][2] = h[5]
+       self.matrix[2][0] = 0
+       self.matrix[2][1] = 0
+       self.matrix[2][2] = 1
+       #self.bi = None
+
+    def transform(self, sourceImage, destinationImage):  #
+        if sourceImage.dtype is not np.dtype('uint8'):
+            raise TypeError('invalid type for sourceImage')
+        if destinationImage.dtype is not np.dtype('uint8'):
+            raise TypeError('invalid type for destinationImage')
+
+        source = self.source
+        xmax = int(max(source[0][0], source[1][0], source[2][0]))
+        xmin = int(min(source[0][0], source[1][0], source[2][0]))
+        ymax = int(max(source[0][1], source[1][1], source[2][1]))
+        ymin = int(min(source[0][1], source[1][1], source[2][1]))
+        xmax += 1
+        xmin -= 1
+        ymax += 1
+        ymin -= 1
+        if xmax > sourceImage.shape[1]:
+            xmax = sourceImage.shape[1]
+        if xmin < 0:
+            xmin = 0
+        if ymax > sourceImage.shape[0]:
+            ymax = sourceImage.shape[0]
+        if ymin < 0:
+            ymin = 0
+
+        img = Image.new("RGB", ((sourceImage.shape[1]), (sourceImage.shape[0])), 0)
+        dest = []
+        for ele in self.destination:
+            dest.append(tuple(ele))
+        newsqu = sourceImage[ymin: ymax, xmin: xmax]
+        #bi = interpolate.RectBivariateSpline(range(ymax - ymin), range(xmax - xmin), z = newsqu, kx = 1, ky = 1)
+        ImageDraw.Draw(img).polygon(dest, outline=255, fill= 255)
+        mask = np.array(img)
+        invers = np.linalg.inv(self.matrix)
+        x, y, sh = np.where(mask == 255)
+        prime_matrix = np.ones(shape=(3, len(x)), dtype=np.float64)
+        prime_matrix[1], prime_matrix[0] = x, y
+        dotproduct = np.matmul(invers, prime_matrix)
+        inte1 = interpolate.RectBivariateSpline(range(ymax - ymin), range(xmax - xmin), z = newsqu[:,:,0], kx = 1, ky = 1)
+        res1 = np.round(inte1.ev(dotproduct[1] - ymin, dotproduct[0] - xmin))
+        inte2 = interpolate.RectBivariateSpline(range(ymax - ymin), range(xmax - xmin), z = newsqu[:,:,1], kx = 1, ky = 1)
+        res2 = np.round(inte2.ev(dotproduct[1] - ymin, dotproduct[0] - xmin))
+        inte3 = interpolate.RectBivariateSpline(range(ymax - ymin), range(xmax - xmin), z = newsqu[:,:,2], kx = 1, ky = 1)
+        res3 = np.round(inte3.ev(dotproduct[1] - ymin, dotproduct[0] - xmin))
+        destinationImage[x, y, 0] = res1[list(range(len(x)))]
+        destinationImage[x, y, 1] = res2[list(range(len(x)))]
+        destinationImage[x, y, 2] = res3[list(range(len(x)))]
+
+
+class ColorBlender:
+    def __init__(self, startImage, startPoints, endImage, endPoints):
+        if not isinstance(startImage, np.ndarray):
+            raise TypeError('startImage is invalid')
+        if not isinstance(startPoints, np.ndarray):
+            raise TypeError('startPoints is invalid')
+        if not isinstance(endImage, np.ndarray):
+            raise TypeError('endImage is invalid')
+        if not isinstance(endPoints, np.ndarray):
+            raise TypeError('endPoints is invalid')
+
+        self.startImage = startImage
+        self.startPoints = startPoints
+        self.endImage = endImage
+        self.endPoints = endPoints
+
+    def getBlendedImage(self, alpha):
+
+        newImage1 = Image.new("RGB", ((self.startImage.shape[1]), (self.startImage.shape[0])), 0)
+        newImage1 = np.array(newImage1)
+        newImage2 = Image.new("RGB", ((self.startImage.shape[1]), (self.startImage.shape[0])), 0)
+        newImage2 = np.array(newImage2)
+
+        source_tri = Delaunay(self.startPoints)
+        start_triangle = self.startPoints[source_tri.simplices].astype(np.float64)
+        end_triangle = self.endPoints[source_tri.simplices] .astype(np.float64)
+        size = len(source_tri.simplices)
+        mid_tri = start_triangle * (1 - alpha) + end_triangle * alpha
+
+        for i in range(size):
+           affine1 = ColorAffine(start_triangle[i], mid_tri[i])
+           affine1.transform(self.startImage, newImage1)
+
+           affine2 = ColorAffine(end_triangle[i], mid_tri[i])
+           affine2.transform(self.endImage, newImage2)
+
+        final_image = np.round((newImage1 * (1 - alpha) + newImage2 * alpha).astype(np.uint8))
+
+        return final_image
+
+    def generateMorphVideo(self, targetFolderPath, sequenceLength, includeResersed):
+        if os.path.exists(targetFolderPath) is False:
+            os.makedirs(targetFolderPath)
+        if sequenceLength < 10:
+            raise ValueError('wrong sequenceLength')
+        alpha = 0
+        increment = 1 / (sequenceLength-1)
+        i = 0
+        while (i < sequenceLength):
+            a = self.getBlendedImage(alpha)
+            digit = str(i+1).zfill(3)
+            imageio.imwrite(targetFolderPath + "/frame{" + digit + "}.jpg", a)
+            alpha += increment
+            if alpha > 1:
+                alpha = 1
+            i += 1
+
+        if includeResersed is True:
+            j = i
+            while i < 2 * sequenceLength:
+                digit = str(i+1).zfill(3)
+                a = self.getBlendedImage(alpha)
+                imageio.imwrite(targetFolderPath + "/frame{" + digit + "}.jpg", a)
+                alpha -= increment
+                if alpha < 0:
+                    alpha = 0
+                i += 1
+
+        video = imageio.get_writer(targetFolderPath + '/' + 'morph.mp4', fps = 5, macro_block_size = None)
+        for myFile in os.listdir(targetFolderPath):
+            frame = targetFolderPath+'/'+myFile
+            video.append_data(imageio.imread(frame))
+
+
+if __name__ == "__main__":
+    start_time = time.time()
+    startImage = scipy.ndimage.imread("Tiger2Gray.jpg")
+    startPoints = np.loadtxt("tiger2.jpg.txt", dtype = np.float64)
+    endImage = scipy.ndimage.imread("WolfGray.jpg")
+    endPoints = np.loadtxt("wolf.jpg.txt", dtype = np.float64)
+    Blen = Blender(startImage, startPoints, endImage, endPoints)
+    final_image = Blen.getBlendedImage( 0.75)
+
+    color_start = scipy.ndimage.imread("Tiger2Color.jpg")
+    startPoints = np.loadtxt("tiger2.jpg.txt", dtype = np.float64)
+    color_end = scipy.ndimage.imread("WolfColor.jpg")
+    endPoints = np.loadtxt("wolf.jpg.txt", dtype = np.float64)
+    BlenColor = ColorBlender(color_start, startPoints, color_end, endPoints)
+    final_image = BlenColor.getBlendedImage( 0.75)
+    imageio.imwrite('resulabc.png', final_image)
+    BlenColor.generateMorphVideo("aly", 11, True)
+    print("time: ", time.time() - start_time)
+
+
+

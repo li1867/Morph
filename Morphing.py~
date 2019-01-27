@@ -1,0 +1,213 @@
+#! /usr/bin/env python3.4
+import time
+import numpy as np
+from PIL.Image import Image
+import scipy
+from scipy.interpolate import RectBivariateSpline
+from scipy.spatial import Delaunay
+from scipy import ndimage
+import imageio
+from PIL import Image, ImageDraw
+
+class Affine:
+    def __init__(self, source, destination):
+        if type(source) is not np.ndarray and source.shape is not (3,2):
+            raise TypeError("invalid type of shape for source")
+        if type(destination) is not np.ndarray and destination.shape is not (3,2):
+            raise TypeError("invalid type of shape for destination")
+
+        self.source = source
+        self.destination = destination
+
+        A = np.ndarray(shape=(6,6))
+        A[0] = [source[0][0], source[0][1], 1, 0, 0, 0]
+        A[1] = [0, 0, 0, source[0][0], source[0][1], 1]
+        A[2] = [source[1][0], source[1][1], 1, 0, 0, 0]
+        A[3] = [0, 0, 0, source[1][0], source[1][1], 1]
+        A[4] = [source[2][0], source[2][1], 1, 0, 0, 0]
+        A[5] = [0, 0, 0, source[2][0], source[2][1], 1]
+        B = np.ndarray(shape=(6,1))
+        B[0] = destination[0][0]
+        B[1] = destination[0][1]
+        B[2] = destination[1][0]
+        B[3] = destination[1][1]
+        B[4] = destination[2][0]
+        B[5] = destination[2][1]
+        h = np.linalg.solve(A, B)
+
+        self.matrix = np.ndarray(shape=(3,3))
+        self.matrix[0][0] = h[0]
+        self.matrix[0][1] = h[1]
+        self.matrix[0][2] = h[2]
+        self.matrix[1][0] = h[3]
+        self.matrix[1][1] = h[4]
+        self.matrix[1][2] = h[5]
+        self.matrix[2][0] = 0
+        self.matrix[2][1] = 0
+        self.matrix[2][2] = 1
+
+        self.bi = None
+
+    def transform(self, sourceImage, destinationImage):  #
+        if isinstance(sourceImage, np.ndarray) == False:
+            raise TypeError("invalid type for sourceImage")
+        if isinstance(destinationImage, np.ndarray) == False:
+            raise TypeError("invalid type for destinationImage")
+
+        img = Image.new("L", (800, 600), 0)
+        dest = []
+        for ele in self.destination:
+            dest.append(tuple(ele))
+
+        ImageDraw.Draw(img).polygon(dest, outline=255, fill= 255)
+        mask = np.array(img)
+        invers = np.linalg.inv(self.matrix)
+        y , x = np.where(mask == 255)
+        prime_matrix = np.array(np.array([x[np.arange(len(x)-1)],y[np.arange(len(y)-1)], np.ones(len(y)-1)]))
+        target=np.dot(invers, prime_matrix)
+        destinationImage[np.array(y[np.arange(len(y)-1)]), np.array(x[np.arange(len(y)-1)])] = np.round(self.bi.ev(target[1], target[0]))
+
+class Blender:
+    def __init__(self, startImage, startPoints, endImage, endPoints):
+        if type(startImage) is not np.ndarray or type(startPoints) is not np.ndarray or type(endImage) is not np.ndarray or type(endPoints) is not np.ndarray:
+            raise TypeError("input are not numpy array")
+        self.startImage = startImage
+        self.startPoints = startPoints
+        self.endImage = endImage
+        self.endPoints = endPoints
+
+    def getBlendedImage(self, alpha):
+        if alpha >= 1 or alpha <= 0:
+            raise ValueError("invalid alpha value")
+
+        newImage1 = Image.new('L', (800, 600), 0)
+        newImage1 = np.array(newImage1)             #source image
+        newImage2 = Image.new('L', (800, 600), 0)
+        newImage2 = np.array(newImage2)             #target image
+
+        source_tri = Delaunay(self.startPoints)
+        start_triangle = self.startPoints[source_tri.simplices].astype(np.float64)
+        end_triangle = self.endPoints[source_tri.simplices] .astype(np.float64)
+        size = len(source_tri.simplices)
+        mid_tri = start_triangle * (1 - alpha) + end_triangle * alpha
+
+        bi_start = RectBivariateSpline(range(self.startImage.shape[0]), range(self.startImage.shape[1]), z=self.startImage, kx=1,ky=1)
+        bi_end = RectBivariateSpline(range(self.endImage.shape[0]), range(self.endImage.shape[1]), z=self.endImage, kx=1, ky=1)
+
+        for i in range(size):
+           affine1 = Affine(start_triangle[i], mid_tri[i])
+           affine1.bi = bi_start
+           affine1.transform(self.startImage, newImage1)
+
+           affine2 = Affine(end_triangle[i], mid_tri[i])
+           affine2.bi = bi_end
+           affine2.transform(self.endImage, newImage2)
+
+        final_image = (newImage1 * (1 - alpha) + newImage2 * alpha).astype(np.uint8)
+
+        return final_image
+
+
+class ColorAffine:
+    def __init__(self, source, destination):
+        if type(source) is not np.ndarray and source.shape is not (3,2):
+            raise TypeError("invalid type of shape for source")
+        if type(destination) is not np.ndarray and destination.shape is not (3,2):
+            raise TypeError("invalid type of shape for destination")
+
+        self.source = source
+        self.destination = destination
+
+        A = np.ndarray(shape=(6,6))
+        A[0] = [source[0][0], source[0][1], 1, 0, 0, 0]
+        A[1] = [0, 0, 0, source[0][0], source[0][1], 1]
+        A[2] = [source[1][0], source[1][1], 1, 0, 0, 0]
+        A[3] = [0, 0, 0, source[1][0], source[1][1], 1]
+        A[4] = [source[2][0], source[2][1], 1, 0, 0, 0]
+        A[5] = [0, 0, 0, source[2][0], source[2][1], 1]
+        B = np.ndarray(shape=(6,1))
+        B[0] = destination[0][0]
+        B[1] = destination[0][1]
+        B[2] = destination[1][0]
+        B[3] = destination[1][1]
+        B[4] = destination[2][0]
+        B[5] = destination[2][1]
+        h = np.linalg.solve(A, B)
+
+        self.matrix = np.ndarray(shape=(3,3))
+        self.matrix[0][0] = h[0]
+        self.matrix[0][1] = h[1]
+        self.matrix[0][2] = h[2]
+        self.matrix[1][0] = h[3]
+        self.matrix[1][1] = h[4]
+        self.matrix[1][2] = h[5]
+        self.matrix[2][0] = 0
+        self.matrix[2][1] = 0
+        self.matrix[2][2] = 1
+        self.bi = None
+
+    def transform(self, sourceImage, destinationImage):
+        if isinstance(sourceImage, np.ndarray) == False:
+            raise TypeError("invalid type for sourceImage")
+        if isinstance(destinationImage, np.ndarray) == False:
+            raise TypeError("invalid type for destinationImage")
+
+        
+
+class ColorBlender:
+    def __init__(self, startImage, startPoints, endImage, endPoints):
+        self.startImage = startImage
+        self.endImage = endImage
+        self.startPoints = startPoints
+        self.endPoints = endPoints
+
+    def getBlenderImage(self, alpha):
+        newImage1 = Image.new("RGB", (800, 600), 0)
+        newImage2 = Image.new("RGB", (800, 600), 0)
+        newImage1 = np.array(newImage1)
+        newImage2 = np.array(newImage2)
+
+
+        vertice1 = Delaunay(self.startPoints)
+        start_triangle = self.startPoints[vertice1.simplices].astype(np.float64)
+        end_triangle = self.endPoints[vertice1.simplices].astype(np.float64)
+        size = len(vertice1.simplices)
+        mid_tri = start_triangle * (1 - alpha) + end_triangle * alpha
+
+        bi_start = RectBivariateSpline(range(self.startImage.shape[0]), range(self.startImage.shape[1]), z=self.startImage, kx=1, ky=1)
+        bi_end = RectBivariateSpline(range(self.endImage.shape[0]), range(self.endImage.shape[1]), z=self.endImage, kx=1, ky=1)
+
+        for i in range(size):
+           affine1 = ColorAffine(start_triangle[i], mid_tri[i])
+           affine1.bi = bi_start
+           affine1.transform(self.startImage, newImage1)
+
+           affine2 = ColorAffine(end_triangle[i], mid_tri[i])
+           affine2.bi = bi_end
+           affine2.transform(self.endImage, newImage2)
+
+        final_image = (newImage1 * (1 - alpha) + newImage2 * alpha).astype(np.uint8)
+        return final_image
+
+if __name__ == "__main__":
+    start_time = time.time()
+    startImage = scipy.ndimage.imread("Tiger2Gray.jpg")
+    startPoints = np.loadtxt("tiger2.jpg.txt", dtype = np.float64)
+    endImage = scipy.ndimage.imread("WolfGray.jpg")
+    endPoints = np.loadtxt("wolf.jpg.txt", dtype = np.float64)
+    Blen = Blender(startImage, startPoints, endImage, endPoints)
+    final_image = Blender.getBlendedImage(Blen, 0.6888)
+    imageio.imwrite('final.png', final_image)
+    print("time: ", time.time() - start_time)
+
+    #print(startImage[0][0])
+    #color
+    startImagec = scipy.ndimage.imread("Tiger2Color.jpg")
+    #print(startImagec[0][0])
+    #endImage = scipy.ndimage.imread("WolfColor.jpg")
+
+    #Blen = Blender(startImage, startPoints, endImage, endPoints)
+    #Blender.getBlendedImage(Blen, 0.5)
+
+
+
